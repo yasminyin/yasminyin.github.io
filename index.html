@@ -1,7 +1,10 @@
 <!DOCTYPE HTML> 
 <html> 
 
+<script src="twgl.js-master/dist/twgl-full.js"></script>
 <script src="unit teapot.js"></script>
+<script src="floor.js"></script>
+
 <script src="gl-matrix-min.js"></script>
 
 <script>
@@ -10,15 +13,15 @@ var shaderProgram;
 var modelview_uniform;
 var normal_uniform;
 var projection_uniform;
+var world_uniform;
 var texture, texture2;
-var cube_vertex_buffer;
-var cube_triangle_buffer;
+var bump_texture;
 var sampler_uniform;
 var sampler2_uniform;
+var bumpsampler_uniform;
 var teapot_vao;
 var vert_pos_attr;
 var vert_normal_attr;
-var vert_texcoord_attr;
 
 //
 // a default vertex shader implemented as a backquoted string variable
@@ -26,69 +29,30 @@ var vert_texcoord_attr;
 
 var vs = `#version 300 es
 
-precision mediump float;
-
-const float PI = 3.1415926535897932384626433832795;
-
 in vec3 aVertexPosition;
 in vec3 aVertexNormal;
-in vec2 aTexCoord;
+in vec2 aTextureCoord;
 
 uniform mat4 uModelViewMatrix;
 uniform mat3 uNormalMatrix;
 uniform mat4 uProjectionMatrix;
+uniform mat4 uWorldMatrix;
+uniform mat4 uProjectionFromLightMatrix;
 
-uniform vec3 uLightPosition;
-
-out vec2 vTexCoord;
-out vec3 vNormal;
-out vec4 color;
+out vec3 vPosition;
+out vec3 p, v, n;
+out vec4 vVertexFromLight;
 
 void main() {
-  // -- Cylindrical Texture -- 
-  vec3 modelPosition = normalize(aVertexPosition);
-  modelPosition.y -= 1.0;
-  modelPosition = normalize(modelPosition);
-  // aVertexPosition.x + 0.5;
-  // vTexCoord.s = -atan(-modelPosition.z, -modelPosition.x) / 2.0 / PI + 0.5;
-  // aVertexPosition.y + 0.5;
-  // vTexCoord.t = modelPosition.y + 0.1;
-  vTexCoord = aTexCoord;
+  vec4 position = uModelViewMatrix * vec4(aVertexPosition, 1.0);
+  p = normalize(position.xyz / position.w);
+  v = normalize(-position.xyz);
+  n = normalize(mat3(uModelViewMatrix) * uNormalMatrix * aVertexNormal);
 
+  vPosition = normalize(aVertexPosition);
+  vVertexFromLight = normalize(uProjectionMatrix * vec4(aVertexPosition, 1.0));
 
-  // -- Light --
-  // Normal(n) in eye coords
-  vec3 n = normalize(uNormalMatrix * aVertexNormal);
-
-  // Vertex Position in eye coords
-  vec4 p4 = uModelViewMatrix * vec4(aVertexPosition, 1.0);
-  vec3 p3 = p4.xyz / p4.w;
-  vec3 v = -normalize(p4.xyz);
-
-  // Vector(l) to the light sourse
-  // vec3 l = normalize(uNormalMatrix * vec3(0.0,1.0,0.0));
-  vec3 l = normalize(uLightPosition - p3);
-  
-  // -- Ambient Light -- 
-  // Ka = .5
-  vec4 ambient_color = vec4(1.0,1.0,1.0,1.0);
-
-
-  // -- Diffuse Light -- 
-  // Kd = .5
-  vec4 diffuse_color = vec4(1.0,1.0,1.0,1.0) * 0.5 * max(0.0, dot(n, l));
-
-
-  // -- Specular Light -- 
-  // Reflection vector(r)
-  vec3 r = normalize(reflect(-l, n));
-  // Ks = .5
-  vec4 specular_color = vec4(1.0,1.0,1.0,1.0) * 0.5 * pow(max(0.0, dot(v, r)), 200.0);
-  
-
-  color = ambient_color + diffuse_color + specular_color;
-
-  gl_Position = uProjectionMatrix * uModelViewMatrix * vec4(aVertexPosition, 1.0);
+  gl_Position = uProjectionMatrix * uModelViewMatrix * uWorldMatrix * vec4(aVertexPosition, 1.0);
 }
 `;
 
@@ -99,96 +63,86 @@ void main() {
 var fs = `#version 300 es
 
 precision mediump float;
-    
-in vec3 vNormal;
-in vec2 vTexCoord;
-in vec4 color;
+const float PI = 3.1415926535897932384626433832795;
 
+in vec3 vPosition;
+in vec3 p, v, n;
+in vec4 vVertexFromLight;
 uniform sampler2D uSampler;
 uniform sampler2D uSampler2;
+uniform sampler2D uBumpSampler;
+uniform vec3 uLightPosition;
 
 out vec4 outColor;
-    
+
+float blackness(vec4 color) {
+    return (3.0 - color.r - color.g - color.b) * color.a * 0.33;
+}
+
+vec3 bump(sampler2D uBumpSampler, vec2 coord, vec3 uDirection, vec3 vDirection) {
+    vec2 dBds = dFdx(coord);
+    vec2 dBdt = dFdy(coord);
+
+    float depth = blackness(texture(uBumpSampler, coord));
+    float x = (blackness(texture(uBumpSampler, coord + dBds)) - depth);
+    float y = (blackness(texture(uBumpSampler, coord + dBdt)) - depth);
+
+
+    return x * uDirection + y * vDirection;
+}
+
 void main() {
-  vec3 illinois = vec3(texture(uSampler, vTexCoord));
-  vec3 stadium = vec3(texture(uSampler2, vTexCoord));
-  vec3 c = 0.5 * illinois + 0.5 * stadium;
+  vec3 lightPosition = vec3(1.0,1.0,0.0);
+  vec3 l = normalize(lightPosition - p);
+
+  //
+  // Texture Mapping
+  //
+  // -- Cylindrical Mapping --
+  vec2 texCoord1;
+  texCoord1.s = atan(vPosition.z, vPosition.x) / (-2.0 * PI);
+  texCoord1.t = (vPosition.y + 0.8) * 0.6;
+
+  // -- Bump Mapping --
+  vec3 sDirection = vec3(-sin(texCoord1.s), 0.0, cos(texCoord1.s));
+  vec3 tDirection = vec3(0.0, 1.0, 0.0);
+  vec3 bumpValue = bump(uBumpSampler, texCoord1, sDirection, tDirection) * 500.0;
+  vec3 bump_normal = normalize(n + bumpValue);
+
+  // -- Sphere Environment Mapping(Reflective Surface) -- 
+  vec2 texCoord2;
+  texCoord2.s = (bump_normal.x + 1.0) * 0.5;
+  texCoord2.t = (bump_normal.y + 1.0) * 0.5;
+
+
+  vec3 illinois = vec3(texture(uSampler, texCoord1.st));
+  vec3 stadium = vec3(texture(uSampler2, texCoord2.st));
+  vec3 bump_illinois = vec3(texture(uBumpSampler, texCoord1.st));
+
+  vec3 color = 0.5 * bump_illinois + 0.5 * stadium;
+
+
+  //
+  // Lighting
+  //
+  // -- Ambient Light -- 
+  vec4 ambient_color = 1.0 * vec4(1.0,1.0,1.0,1.0) * vec4(0.3,0.3,0.3,1.0);
+
+  // -- Diffuse Light -- 
+  vec4 diffuse_color = 0.8 * vec4(1.0,1.0,1.0,1.0) * vec4(illinois,1.0) * max(0.0, dot(bump_normal, l));
+
+  // -- Specular Light -- 
+  // Reflection vector(r)
+  vec3 r = normalize(reflect(-l, n));
+  vec4 specular_color = 0.8 * vec4(1.0,1.0,1.0,1.0) * vec4(1.0,1.0,1.0,1.0) * pow(max(dot(v, r), 0.0), 50.0);
   
-  outColor = color * vec4(c,1.0);
+  vec4 light = ambient_color + diffuse_color + specular_color;
+
+  
+  outColor = light * vec4(color, 1.0);
 }
 `;
 
-function setnormals(positions, normals, faces) {
-    for (var i = 0; i < faces.length; i += 3) {
-        // -- FACE --
-        var vertex1 = glMatrix.vec3.fromValues(positions[faces[i]*3], positions[faces[i]*3+1], positions[faces[i]*3+2]);
-        var vertex2 = glMatrix.vec3.fromValues(positions[faces[i+1]*3], positions[faces[i+1]*3+1], positions[faces[i+1]*3+2]);
-        var vertex3 = glMatrix.vec3.fromValues(positions[faces[i+2]*3], positions[faces[i+2]*3+1], positions[faces[i+2]*3+2]);
-
-        // Normal of the face
-        var v1 = glMatrix.vec3.create();
-        var v2 = glMatrix.vec3.create();
-        var normal_face = glMatrix.vec3.create();
-        glMatrix.vec3.subtract(v1, vertex2, vertex1);
-        glMatrix.vec3.subtract(v2, vertex3, vertex1);
-        glMatrix.vec3.cross(normal_face, v1, v2);
-
-        normals[faces[i]*3  ] += normal_face[0];
-        normals[faces[i]*3+1] += normal_face[1];
-        normals[faces[i]*3+2] += normal_face[2];
-
-        normals[faces[i+1]*3  ] += normal_face[0];
-        normals[faces[i+1]*3+1] += normal_face[1];
-        normals[faces[i+1]*3+2] += normal_face[2];
-
-        normals[faces[i+2]*3  ] += normal_face[0];
-        normals[faces[i+2]*3+1] += normal_face[1];
-        normals[faces[i+2]*3+2] += normal_face[2];
-    }
-
-    for (var i = 0; i < normals.length; i += 3) {
-        var vertex = glMatrix.vec3.fromValues(normals[i], normals[i+1], normals[i+2]);
-        glMatrix.vec3.normalize(vertex, vertex);
-        normals[i  ] = vertex[0];
-        normals[i+1] = vertex[1];
-        normals[i+2] = vertex[2];
-    }
-    return normals;
-}
-function isPowerOf2(value) {
-    return (value & (value - 1)) == 0;
-}
-
-function handleTextureLoaded(image, texture) {
-    console.log("handleTextureLoaded, image = " + image);
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA,gl.UNSIGNED_BYTE, image);
-    // Check if the image is a power of 2 in both dimensions.
-    if (isPowerOf2(image.width) && isPowerOf2(image.height)) {
-        // Yes, it's a power of 2. Generate mips.
-        gl.generateMipmap(gl.TEXTURE_2D);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_NEAREST);
-        console.log("Loaded power of 2 texture");
-    } else {
-        // No, it's not a power of 2. Turn of mips and set wrapping to clamp to edge
-        gl.texParameteri(gl.TETXURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TETXURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TETXURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-        console.log("Loaded non-power of 2 texture");
-    }
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-}
-
-function loadCubeMapFace(gl, target, cube_texture, url){
-    var image = new Image();
-    image.onload = function()
-    {
-      gl.bindTexture(gl.TEXTURE_CUBE_MAP, cube_texture);
-      gl.texImage2D(target,0,gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
-      handleTextureLoaded(image, cube_texture);
-    }
-    image.src = url;
-}
 
 function initwebgl() {
 
@@ -203,16 +157,20 @@ function initwebgl() {
 
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
 
-  loadshaders(vs,fs);
+  initshaders();
+  loadshaders();
 
   // set up vertex array object
-
+ 
+  //
+  // TEAPOT
+  //
   teapot_vao = gl.createVertexArray();
   gl.bindVertexArray(teapot_vao);
 
   // create a coordinate buffer of vertex positions and
   // connect it to the vertex shader positions
-
+ 
   gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
   gl.bufferData(gl.ARRAY_BUFFER,
                 new Float32Array(teapot.positions),
@@ -221,24 +179,24 @@ function initwebgl() {
   gl.enableVertexAttribArray(vert_pos_attr);
   gl.vertexAttribPointer(vert_pos_attr, 3, gl.FLOAT, false, 0, 0);
 
+
   // create a coordinate buffer of vertex positions and
   // connect it to the vertex shader positions
   // but normalize the normals first
 
-  var x,y,z,d;
-  for (var i = 0; i < teapot.normals.length; i += 3) {
+  var x,y,z,d,i;
+  for (i = 0; i < teapot.normals.length; i += 3) {
     x = teapot.normals[i];
     y = teapot.normals[i+1];
     z = teapot.normals[i+2];
 
     d = 1.0/Math.sqrt(x*x + y*y + z*z);
 
-    teapot.normals[i] *= d;
+    teapot.normals[i] *= d;   
     teapot.normals[i+1] *= d;
     teapot.normals[i+2] *= d;
+    
   }
-
-  // setnormals(teapot.positions, teapot.normals, teapot.faces);
 
   gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
   gl.bufferData(gl.ARRAY_BUFFER,
@@ -255,91 +213,10 @@ function initwebgl() {
                 new Uint16Array(teapot.faces),
                 gl.STATIC_DRAW);
 
-  // -- Cube --
-  cube_vertex_buffer = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, cube_vertex_buffer);
-  var cube_vertices = [
-                        // Front face
-                        -100.0, -100.0,  100.0,
-                        100.0, -100.0,  100.0,
-                        100.0,  100.0,  100.0,
-                        -100.0,  100.0,  100.0,
 
-                        // Back face
-                        -100.0, -100.0, -100.0,
-                        -100.0,  100.0, -100.0,
-                        100.0,  100.0, -100.0,
-                        100.0, -100.0, -100.0,
-
-                        // Top face
-                        -100.0,  100.0, -100.0,
-                        -100.0,  100.0,  100.0,
-                        100.0,  100.0,  100.0,
-                        100.0,  100.0, -100.0,
-
-                        // Bottom face
-                        -100.0, -100.0, -100.0,
-                        100.0, -100.0, -100.0,
-                        100.0, -100.0,  100.0,
-                        -100.0, -100.0,  100.0,
-
-                        // Right face
-                        100.0, -100.0, -100.0,
-                        100.0,  100.0, -100.0,
-                        100.0,  100.0,  100.0,
-                        100.0, -100.0,  100.0,
-
-                        // Left face
-                        -100.0, -100.0, -100.0,
-                        -100.0, -100.0,  100.0,
-                        -100.0,  100.0,  100.0,
-                        -100.0,  100.0, -100.0
-                      ];
-
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(cube_vertices), gl.STATIC_DRAW);
-
-  cube_triangle_buffer = gl.createBuffer();
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, cube_triangle_buffer);
-
-  var cube_vertex_indices = [
-                              0,  1,  2,      0,  2,  3,    // front
-                              4,  5,  6,      4,  6,  7,    // back
-                              8,  9,  10,     8,  10, 11,   // top
-                              12, 13, 14,     12, 14, 15,   // bottom
-                              16, 17, 18,     16, 18, 19,   // right
-                              20, 21, 22,     20, 22, 23    // left
-                            ];
-
-  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(cube_vertex_indices), gl.STATIC_DRAW);
-    
   //
   // set up texture and sampler
   //
-
-  texture = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_CUBE_MAP, texture);
-
-  //
-  // load texture image using webgl2fundamentals boilerplate
-  // initially creates just a 1x1 blue pixel as a placeholder
-  // replaced by actual texture image once loaded
-  //
-
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  
-  loadCubeMapFace(gl, gl.TEXTURE_CUBE_MAP_POSITIVE_X, texture, "cube-right.png");
-  loadCubeMapFace(gl, gl.TEXTURE_CUBE_MAP_NEGATIVE_X, texture, "cube-left.png");
-  loadCubeMapFace(gl, gl.TEXTURE_CUBE_MAP_POSITIVE_Y, texture, "cube-top.png");
-  loadCubeMapFace(gl, gl.TEXTURE_CUBE_MAP_NEGATIVE_Y, texture, "cube-bottom.png");
-  loadCubeMapFace(gl, gl.TEXTURE_CUBE_MAP_POSITIVE_Z, texture, "cube-front.png");
-  loadCubeMapFace(gl, gl.TEXTURE_CUBE_MAP_NEGATIVE_Z, texture, "cube-back.png");
-  
-  
-  
-/*
 
   texture = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -347,28 +224,6 @@ function initwebgl() {
   var sampler = gl.createSampler();
   gl.bindSampler(0, sampler);
 
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA,
-                gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 255, 255]));
-
-  var image = new Image();
-  image.src = "illinois512.png";
-  
-  image.addEventListener("load", function() {
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 512, 512, 0, gl.RGBA, gl.UNSIGNED_BYTE, image);
-    gl.generateMipmap(gl.TEXTURE_2D);
-  });
-*/
-  //
-  // set up second texture and sampler
-  //
-
-  // texture2 = gl.createTexture();
-  // gl.bindTexture(gl.TEXTURE_2D, texture2);
-  // gl.activeTexture(gl.TEXTURE0);
-
-  // var sampler2 = gl.createSampler();
-  // gl.bindSampler(1, sampler2);
 
   //
   // load texture image using webgl2fundamentals boilerplate
@@ -376,7 +231,35 @@ function initwebgl() {
   // replaced by actual texture image once loaded
   //
 
-  /*gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA,
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA,
+                gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 255, 255]));
+
+  var image = new Image();
+  image.src = "illinois512.png";
+
+  image.addEventListener("load", function() {
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 502, 485, 0, gl.RGBA, gl.UNSIGNED_BYTE, image);
+    gl.generateMipmap(gl.TEXTURE_2D);
+  });
+
+  //
+  // set up second texture and sampler
+  //
+
+  texture2 = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texture2);
+
+  var sampler2 = gl.createSampler();
+  gl.bindSampler(1, sampler2);
+
+  //
+  // load texture image using webgl2fundamentals boilerplate
+  // initially creates just a 1x1 blue pixel as a placeholder
+  // replaced by actual texture image once loaded
+  //
+
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA,
                 gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 255, 255]));
 
   var image2 = new Image();
@@ -386,7 +269,27 @@ function initwebgl() {
     gl.bindTexture(gl.TEXTURE_2D, texture2);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 256, 0, gl.RGBA, gl.UNSIGNED_BYTE, image2);
     gl.generateMipmap(gl.TEXTURE_2D);
-  });*/
+  });
+
+
+  
+  bump_texture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, bump_texture);
+
+  var bumpSampler = gl.createSampler();
+  gl.bindSampler(2, bumpSampler);
+
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA,
+                gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 255, 255]));
+
+  var bumpImage = new Image();
+  bumpImage.src = "illinois512.png";
+
+  bumpImage.addEventListener('load', function () {
+    gl.bindTexture(gl.TEXTURE_2D, bump_texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 502, 485, 0, gl.RGBA, gl.UNSIGNED_BYTE, bumpImage);
+    gl.generateMipmap(gl.TEXTURE_2D);
+  });
 
 
   //
@@ -399,88 +302,138 @@ function initwebgl() {
   requestAnimationFrame(draw);
 }
 
-function loadshaders(vertexShaderSource,fragmentShaderSource) {
+/*function createFrameBufferObject(gl) {
+  var frame_buffer, status;
+
+  // Create a frame buffer object
+  frame_buffer = gl.createFramebuffer();
+  if (!frame_buffer) {
+    alert('Failed to create frame buffer object');
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, frame_buffer);
+
+  // Create and initialize a texture buffer to hold the colors.
+  color_texture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, color_texture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 500, 500, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  // Create and initialize a texture buffer to hold the depth values.
+  depth_buffer = gl.createRenderbuffer();
+  gl.bindRenderbuffer(gl.RENDERBUFFER, depth_buffer);
+  gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, 500, 500);
+
+  // Attach the specific buffers to the frame buffer.
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, color_texture, 0);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT,  gl.RENDERBUFFER, depth_buffer);
+
+  // Verify that the frame buffer is valid.
+  status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (status !== gl.FRAMEBUFFER_COMPLETE) {
+    alert("The created frame buffer is invalid: " + status.toString());
+  }
+
+  // Unbind the buffer objects.
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.bindTexture(gl.TEXTURE_2D, null);
+  gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+
+  return frame_buffer;
+}*/
+
+function initshaders() {
   var vstextbox = document.getElementById("vertexshader");
 
-  var vertexShader = gl.createShader(gl.VERTEX_SHADER);
-  gl.shaderSource(vertexShader, vertexShaderSource);
-  gl.compileShader(vertexShader);
-  if (!gl.getShaderParameter(vertexShader, gl.COMPILE_STATUS))
-    alert("Vertex Shader Error:\n" + gl.getShaderInfoLog(vertexShader));
+  var vshader = gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vshader, vs);
+  gl.compileShader(vshader);
+  if (!gl.getShaderParameter(vshader, gl.COMPILE_STATUS))
+    alert("Vertex Shader Error:\n" + gl.getShaderInfoLog(vshader));
 
   var fstextbox = document.getElementById("fragmentshader");
 
-  var fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
-  gl.shaderSource(fragmentShader, fragmentShaderSource);
-  gl.compileShader(fragmentShader);
-  if (!gl.getShaderParameter(fragmentShader, gl.COMPILE_STATUS))
-    alert("Fragment Shader Error:\n" + gl.getShaderInfoLog(fragmentShader));
-
-  //
-  // Compile shaders and get link ID's to the attributes and uniforms
-  //
+  var fshader = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(fshader, fs);
+  gl.compileShader(fshader);
+  if (!gl.getShaderParameter(fshader, gl.COMPILE_STATUS))
+    alert("Fragment Shader Error:\n" + gl.getShaderInfoLog(fshader));
 
   shaderProgram = gl.createProgram();
-  gl.attachShader(shaderProgram, vertexShader);
-  gl.attachShader(shaderProgram, fragmentShader);
+  gl.attachShader(shaderProgram, vshader);
+  gl.attachShader(shaderProgram, fshader);
   gl.linkProgram(shaderProgram);
   if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS))
-    alert("Failed to setup shaders");
+    alert("Failed to setup shaders");   
+}
 
+function loadshaders() {
   vert_pos_attr = gl.getAttribLocation(shaderProgram, "aVertexPosition");
   vert_normal_attr = gl.getAttribLocation(shaderProgram, "aVertexNormal");
   modelview_uniform = gl.getUniformLocation(shaderProgram, "uModelViewMatrix"); 
   normal_uniform = gl.getUniformLocation(shaderProgram, "uNormalMatrix"); 
   projection_uniform = gl.getUniformLocation(shaderProgram, "uProjectionMatrix"); 
+  world_uniform = gl.getUniformLocation(shaderProgram, "uWorldMatrix");
   sampler_uniform = gl.getUniformLocation(shaderProgram, "uSampler"); 
   sampler2_uniform = gl.getUniformLocation(shaderProgram, "uSampler2"); 
-  vert_texcoord_attr = gl.getAttribLocation(shaderProgram, "aTexCoord");
+  bumpsampler_uniform = gl.getUniformLocation(shaderProgram, "uBumpSampler");
 }
-
 
 //
 // draw callback function that is passed to requestAnimationFrame()
 //
 
-function draw(time) {
+function drawTeapot(time) {
+  gl.viewport(0, 0, 500, 500);
   gl.clearColor(0.075, 0.16, 0.294, 1.0);
   gl.clearDepth(1.0);
   gl.enable(gl.DEPTH_TEST);
+  gl.enable(gl.CULL_FACE);
   gl.depthFunc(gl.LEQUAL);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
   modelview = glMatrix.mat4.create();
   glMatrix.mat4.translate(modelview,modelview,[0.0, 0.0, -2.0]);
-  glMatrix.mat4.rotateY(modelview,modelview, time*0.001);
+  glMatrix.mat4.rotateY(modelview,modelview, time*0.0005);
 
   normalmatrix = glMatrix.mat3.create();
   glMatrix.mat3.normalFromMat4(normalmatrix,modelview);
+
+  worldmatrix = glMatrix.mat4.create();
+  glMatrix.mat4.translate(worldmatrix,worldmatrix,[0.0, 0.0, 0.0]);
+  glMatrix.mat4.rotateY(worldmatrix,worldmatrix, time*0.0005);
+
 
   gl.useProgram(shaderProgram);
 
   gl.uniformMatrix4fv(modelview_uniform, false, modelview);
   gl.uniformMatrix3fv(normal_uniform, false, normalmatrix);
   gl.uniformMatrix4fv(projection_uniform, false, projection);
+  gl.uniformMatrix4fv(world_uniform, false, worldmatrix);
 
   gl.uniform1i(sampler_uniform,0);
   gl.uniform1i(sampler2_uniform,1);
+  gl.uniform1i(bumpsampler_uniform,2);
 
   gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_CUBE_MAP, texture);
-  gl.uniform1i(gl.getUniformLocation(shaderProgram, "uSampler"), 0);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, texture2);
+  gl.activeTexture(gl.TEXTURE2);
+  gl.bindTexture(gl.TEXTURE_2D, bump_texture);
 
-  // Draw Cude
-  
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, cube_triangle_buffer);
-  gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0);
-  // gl.activeTexture(gl.TEXTURE1);
-  // gl.bindTexture(gl.TEXTURE_2D, texture2);
 
   gl.bindVertexArray(teapot_vao);
   gl.drawElements(gl.TRIANGLES,
                   teapot.faces.length,
                   gl.UNSIGNED_SHORT,
                   0);
+}
+
+function draw(time) {
+  drawTeapot(time);
 
   requestAnimationFrame(draw);
 }
